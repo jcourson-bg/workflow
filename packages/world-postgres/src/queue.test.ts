@@ -2,23 +2,15 @@ import { JsonTransport } from '@vercel/queue';
 import { MessageId, type QueuePayload } from '@workflow/world';
 import { makeWorkerUtils, run, type WorkerUtils } from 'graphile-worker';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createLocalWorld, createQueueExecutor } from '@workflow/world-local';
-import { createQueue } from './queue.js';
 import { MessageData } from './message.js';
+import { createQueue } from './queue.js';
 
 const transport = new JsonTransport();
 
 vi.mock('graphile-worker', () => ({
-  Logger: class Logger {
-    constructor(_: unknown) {}
-  },
+  Logger: class Logger {},
   makeWorkerUtils: vi.fn(),
   run: vi.fn(),
-}));
-
-vi.mock('@workflow/world-local', () => ({
-  createLocalWorld: vi.fn(),
-  createQueueExecutor: vi.fn(),
 }));
 
 describe('postgres queue direct execution', () => {
@@ -30,12 +22,10 @@ describe('postgres queue direct execution', () => {
   const runnerMock = {
     stop: vi.fn(),
   };
-  const executeMessage = vi.fn();
-  const registerHandler = vi.fn();
-  const executorClose = vi.fn();
-  const wrappedHandler = vi.fn(async () => Response.json({ ok: true }));
-  const localWorldClose = vi.fn();
-  const createQueueHandler = vi.fn(() => wrappedHandler);
+  const handler =
+    vi.fn<
+      [unknown, { attempt: number; queueName: string; messageId: string }]
+    >();
   const postgres = vi.fn(async () => [{ exists: false }]) as any;
 
   beforeEach(() => {
@@ -43,38 +33,26 @@ describe('postgres queue direct execution', () => {
 
     vi.mocked(makeWorkerUtils).mockResolvedValue(workerUtilsMock);
     vi.mocked(run).mockResolvedValue(runnerMock as any);
-    vi.mocked(createQueueExecutor).mockReturnValue({
-      executeMessage,
-      registerHandler,
-      close: executorClose,
-    });
-    vi.mocked(createLocalWorld).mockReturnValue({
-      createQueueHandler,
-      close: localWorldClose,
-    } as any);
+    handler.mockResolvedValue(undefined);
   });
 
-  it('registers queue handlers with the shared executor', () => {
-    const queue = createQueue(
-      { connectionString: 'postgres://test' },
-      postgres
-    );
-    const handler = vi.fn(async () => undefined);
-
-    const wrapped = queue.createQueueHandler('__wkf_step_', handler);
-
-    expect(createQueueHandler).toHaveBeenCalledWith('__wkf_step_', handler);
-    expect(registerHandler).toHaveBeenCalledWith('__wkf_step_', wrappedHandler);
-    expect(wrapped).toBe(wrappedHandler);
-  });
-
-  it('executes graphile jobs through the extracted executor', async () => {
-    executeMessage.mockResolvedValueOnce({ type: 'completed' });
+  it('returns an HTTP handler from createQueueHandler', () => {
     const queue = createQueue(
       { connectionString: 'postgres://test' },
       postgres
     );
 
+    const httpHandler = queue.createQueueHandler('__wkf_step_', handler);
+
+    expect(httpHandler).toBeTypeOf('function');
+  });
+
+  it('invokes the handler directly from the graphile task', async () => {
+    const queue = createQueue(
+      { connectionString: 'postgres://test' },
+      postgres
+    );
+    queue.createQueueHandler('__wkf_workflow_', handler);
     await queue.start();
 
     const task = getTaskHandler('workflow_flows');
@@ -88,13 +66,14 @@ describe('postgres queue direct execution', () => {
 
     await task(payload, {} as any);
 
-    expect(executeMessage).toHaveBeenCalledWith({
-      queueName: '__wkf_workflow_test-flow',
-      messageId: payload.messageId,
-      attempt: 1,
-      body: transport.serialize(message),
-      headers: { traceparent: 'trace-parent' },
-    });
+    expect(handler).toHaveBeenCalledWith(
+      message,
+      expect.objectContaining({
+        queueName: '__wkf_workflow_test-flow',
+        messageId: payload.messageId,
+        attempt: 1,
+      })
+    );
   });
 
   it('durably reschedules execution with incremented attempt metadata', async () => {
@@ -102,15 +81,13 @@ describe('postgres queue direct execution', () => {
     vi.setSystemTime(new Date('2024-01-01T00:00:00.000Z'));
 
     try {
-      executeMessage.mockResolvedValueOnce({
-        type: 'reschedule',
-        timeoutSeconds: 5,
-      });
+      handler.mockResolvedValueOnce({ timeoutSeconds: 5 });
 
       const queue = createQueue(
         { connectionString: 'postgres://test' },
         postgres
       );
+      queue.createQueueHandler('__wkf_step_', handler);
       await queue.start();
 
       const task = getTaskHandler('workflow_steps');
@@ -127,13 +104,14 @@ describe('postgres queue direct execution', () => {
 
       await task(payload, {} as any);
 
-      expect(executeMessage).toHaveBeenCalledWith({
-        queueName: '__wkf_step_test-step',
-        messageId: payload.messageId,
-        attempt: 1,
-        body: transport.serialize(message),
-        headers: { traceparent: 'trace-parent' },
-      });
+      expect(handler).toHaveBeenCalledWith(
+        message,
+        expect.objectContaining({
+          queueName: '__wkf_step_test-step',
+          messageId: payload.messageId,
+          attempt: 1,
+        })
+      );
 
       expect(workerUtilsMock.addJob).toHaveBeenLastCalledWith(
         'workflow_steps',
@@ -158,10 +136,10 @@ describe('postgres queue direct execution', () => {
 
   it('deduplicates concurrent executions with the same idempotency key', async () => {
     let releaseExecution!: () => void;
-    executeMessage.mockImplementationOnce(
+    handler.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
-          releaseExecution = () => resolve({ type: 'completed' });
+          releaseExecution = () => resolve(undefined);
         })
     );
 
@@ -169,6 +147,7 @@ describe('postgres queue direct execution', () => {
       { connectionString: 'postgres://test' },
       postgres
     );
+    queue.createQueueHandler('__wkf_step_', handler);
     await queue.start();
 
     const task = getTaskHandler('workflow_steps');
@@ -189,7 +168,7 @@ describe('postgres queue direct execution', () => {
     const second = task(payload, {} as any);
 
     await vi.waitFor(() => {
-      expect(executeMessage).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledTimes(1);
     });
 
     releaseExecution();
@@ -197,12 +176,11 @@ describe('postgres queue direct execution', () => {
   });
 
   it('skips duplicate executions after the first idempotent run completes', async () => {
-    executeMessage.mockResolvedValueOnce({ type: 'completed' });
-
     const queue = createQueue(
       { connectionString: 'postgres://test' },
       postgres
     );
+    queue.createQueueHandler('__wkf_step_', handler);
     await queue.start();
 
     const task = getTaskHandler('workflow_steps');
@@ -222,16 +200,15 @@ describe('postgres queue direct execution', () => {
     await task(payload, {} as any);
     await task(payload, {} as any);
 
-    expect(executeMessage).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledTimes(1);
   });
 
-  it('forwards graphile retry attempts to queue execution metadata', async () => {
-    executeMessage.mockResolvedValueOnce({ type: 'completed' });
-
+  it('forwards graphile retry attempts to handler metadata', async () => {
     const queue = createQueue(
       { connectionString: 'postgres://test' },
       postgres
     );
+    queue.createQueueHandler('__wkf_step_', handler);
     await queue.start();
 
     const task = getTaskHandler('workflow_steps');
@@ -249,7 +226,8 @@ describe('postgres queue direct execution', () => {
 
     await task(payload, { job: { attempts: 4 } });
 
-    expect(executeMessage).toHaveBeenCalledWith(
+    expect(handler).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({
         attempt: 4,
       })
@@ -299,6 +277,22 @@ describe('postgres queue direct execution', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('throws when no handler is registered for the queue prefix', async () => {
+    const queue = createQueue(
+      { connectionString: 'postgres://test' },
+      postgres
+    );
+    await queue.start();
+
+    const task = getTaskHandler('workflow_flows');
+    const message = { runId: 'run_01ABC' } satisfies QueuePayload;
+    const payload = buildMessageData('__wkf_workflow_test-flow', message);
+
+    await expect(task(payload, {} as any)).rejects.toThrow(
+      'No handler registered'
+    );
   });
 });
 
