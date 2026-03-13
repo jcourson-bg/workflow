@@ -7,7 +7,6 @@ import {
   type QueuePrefix,
   type ValidQueueName,
 } from '@workflow/world';
-import { createLocalWorld, createQueueExecutor } from '@workflow/world-local';
 import {
   Logger,
   makeWorkerUtils,
@@ -20,6 +19,8 @@ import { monotonicFactory } from 'ulid';
 import z from 'zod';
 import type { PostgresWorldConfig } from './config.js';
 import { MessageData } from './message.js';
+
+type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
 function createGraphileLogger() {
   const isJsonMode = () => process.env.WORKFLOW_JSON_MODE === '1';
@@ -50,12 +51,12 @@ const GraphileHelpers = z.object({
 /**
  * The Postgres queue works by creating two job types in graphile-worker:
  * - `workflow` for workflow jobs
- *   - `step` for step jobs
+ * - `step` for step jobs
  *
  * When a message is queued, it is sent to graphile-worker with the appropriate job type.
- * When a job is processed, it is deserialized and then re-queued into the _local world_, showing that
- * we can reuse the local world, mix and match worlds to build
- * hybrid architectures, and even migrate between worlds.
+ * When a job is processed, the registered handler is invoked directly within the
+ * graphile-worker task. This keeps the job locked for the duration of execution,
+ * so graphile-worker's built-in retry handles process crashes.
  */
 export type PostgresQueue = Queue & {
   start(): Promise<void>;
@@ -66,10 +67,6 @@ export function createQueue(
   config: PostgresWorldConfig,
   postgres: Postgres.Sql
 ): PostgresQueue {
-  const port = process.env.PORT ? Number(process.env.PORT) : undefined;
-  const localWorld = createLocalWorld({ dataDir: undefined, port });
-  const executor = createQueueExecutor({ port });
-
   const transport = new JsonTransport();
   const generateMessageId = monotonicFactory();
 
@@ -79,12 +76,19 @@ export function createQueue(
     __wkf_step_: `${prefix}steps`,
   } as const satisfies Record<QueuePrefix, string>;
 
-  const createQueueHandler: Queue['createQueueHandler'] = (prefix, handler) => {
-    const wrappedHandler = localWorld.createQueueHandler(prefix, handler);
-    // Register the HTTP-compatible handler so Graphile workers can execute it
-    // directly in-process when the route module has been loaded.
-    executor.registerHandler(prefix, wrappedHandler);
-    return wrappedHandler;
+  const handlers = new Map<QueuePrefix, QueueHandler>();
+
+  const createQueueHandler: Queue['createQueueHandler'] = (
+    queuePrefix,
+    handler
+  ) => {
+    handlers.set(queuePrefix, handler);
+
+    return async () =>
+      Response.json(
+        { error: 'Postgres world delivers messages via graphile-worker' },
+        { status: 405 }
+      );
   };
 
   const getDeploymentId: Queue['getDeploymentId'] = async () => {
@@ -243,7 +247,7 @@ export function createQueue(
     return { messageId };
   };
 
-  function createTaskHandler(queue: QueuePrefix) {
+  function createTaskHandler(queuePrefix: QueuePrefix) {
     return async (payload: unknown, helpers: unknown) => {
       const messageData = MessageData.parse(payload);
       const graphileAttempt = GraphileHelpers.safeParse(helpers);
@@ -251,6 +255,13 @@ export function createQueue(
         ? graphileAttempt.data.job.attempts
         : messageData.attempt;
       const executeTask = async (): Promise<'completed' | 'rescheduled'> => {
+        const handler = handlers.get(queuePrefix);
+        if (!handler) {
+          throw new Error(
+            `No handler registered for queue prefix "${queuePrefix}"`
+          );
+        }
+
         const bodyStream = Stream.Readable.toWeb(
           Stream.Readable.from([messageData.data])
         );
@@ -258,39 +269,32 @@ export function createQueue(
           bodyStream as ReadableStream<Uint8Array>
         );
         QueuePayloadSchema.parse(body);
-        const queueName = `${queue}${messageData.id}` as const;
-        const result = await executor.executeMessage({
+        const queueName = `${queuePrefix}${messageData.id}` as ValidQueueName;
+
+        const result = await handler(body, {
           queueName,
           messageId: messageData.messageId,
           attempt,
-          body: messageData.data,
-          headers: messageData.headers,
         });
 
-        if (result.type === 'completed') {
+        if (!result || typeof result.timeoutSeconds !== 'number') {
           return 'completed';
         }
 
-        if (result.type === 'reschedule') {
-          // Schedule the follow-up job before we return so a crash cannot
-          // lose the wake-up request.
-          await addGraphileJob({
-            queuePrefix: queue,
-            queueId: messageData.id,
-            body: messageData.data,
-            messageId: messageData.messageId,
-            attempt: attempt + 1,
-            idempotencyKey: messageData.idempotencyKey,
-            headers: messageData.headers,
-            delaySeconds: result.timeoutSeconds,
-            jobKey: messageData.idempotencyKey ?? messageData.messageId,
-          });
-          return 'rescheduled';
-        }
-
-        throw new Error(
-          `[postgres world] Queue execution failed (${result.status}): ${result.text}`
-        );
+        // Schedule the follow-up job before we return so a crash cannot
+        // lose the wake-up request.
+        await addGraphileJob({
+          queuePrefix,
+          queueId: messageData.id,
+          body: messageData.data,
+          messageId: messageData.messageId,
+          attempt: attempt + 1,
+          idempotencyKey: messageData.idempotencyKey,
+          headers: messageData.headers,
+          delaySeconds: result.timeoutSeconds,
+          jobKey: messageData.idempotencyKey ?? messageData.messageId,
+        });
+        return 'rescheduled';
       };
 
       const idempotencyKey = messageData.idempotencyKey;
@@ -359,8 +363,6 @@ export function createQueue(
         workerUtils = null;
       }
       startPromise = null;
-      await executor.close();
-      await localWorld.close?.();
     },
   };
 }
