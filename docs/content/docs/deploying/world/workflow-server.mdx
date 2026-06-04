@@ -1,0 +1,68 @@
+---
+title: Self-Hosted Workflow Server
+description: Run the workflow-server API on your own infrastructure with custom authentication.
+type: integration
+summary: Deploy a workflow-server-compatible API backed by PostgreSQL and optional Vercel Blob.
+prerequisites:
+  - /docs/deploying
+related:
+  - /docs/deploying/world/postgres-world
+  - /docs/deploying/world/vercel-world
+---
+
+The [`@workflow/workflow-server`](https://github.com/vercel/workflow/tree/main/packages/workflow-server) package implements the HTTP API consumed by `@workflow/world-vercel`. Use it when you want **managed-workflow-server parity** with **your own auth** and data residency, while still using the Workflow DevKit runtime and (optionally) Vercel Queues for execution.
+
+## What it provides
+
+- **Full v2 API** — runs, events, steps, hooks, streams, refs (`remoteRefBehavior=lazy|resolve`)
+- **v1 compatibility** — `/v1/runs/create`, cancel, events
+- **Encryption meta API** — `/v1/workflow/run-key/:deploymentId`
+- **PostgreSQL storage** — same event-sourced model as [Postgres World](/worlds/postgres)
+- **Optional Vercel Blob** — large payload refs (`s3rf:`)
+- **Bearer auth** — bring your own tokens (no Vercel OIDC required for storage)
+
+## Quick start
+
+```bash
+export WORKFLOW_POSTGRES_URL="postgres://..."
+pnpm exec workflow-postgres-setup
+
+export WORKFLOW_SERVER_AUTH_TOKEN="your-secret"
+pnpm --filter @workflow/workflow-server exec workflow-server
+```
+
+Point `@workflow/world-vercel` at your server:
+
+```bash
+export WORKFLOW_TARGET_WORLD=vercel
+export WORKFLOW_VERCEL_BACKEND_URL="https://your-server.example.com/api"
+export WORKFLOW_VERCEL_AUTH_TOKEN="your-secret"
+export WORKFLOW_VERCEL_PROJECT="my-project"
+export WORKFLOW_VERCEL_TEAM="my-team"
+```
+
+Or set `WORKFLOW_SERVER_URL_OVERRIDE` to your API origin (without `/api` suffix) when using the Vercel proxy headers.
+
+## Custom authentication
+
+```typescript
+import { createWorkflowServer } from '@workflow/workflow-server';
+
+const { app } = createWorkflowServer({
+  auth: async (request) => {
+    if (request.headers.get('x-api-key') === process.env.API_KEY) {
+      return { ok: true };
+    }
+    return { ok: false, status: 401, message: 'Unauthorized' };
+  },
+});
+```
+
+## Execution (queues)
+
+The workflow-server package is the **storage/control-plane API**. Step and workflow **execution** still requires:
+
+- **Vercel Queues** + `/.well-known/workflow/v1/flow|step` on your app (same as [Vercel World](/worlds/vercel)), or
+- **Postgres World workers** via `getWorld().start()` if you use `@workflow/world-postgres` for queuing instead.
+
+See the [workflow-server README](https://github.com/vercel/workflow/tree/main/packages/workflow-server) for environment variables and deployment notes.

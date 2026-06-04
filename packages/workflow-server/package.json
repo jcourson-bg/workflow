@@ -1,0 +1,53 @@
+{
+  "name": "@workflow/workflow-server",
+  "version": "0.1.0",
+  "description": "Self-hosted workflow-server compatible HTTP API for Workflow DevKit",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/workflow.git",
+    "directory": "packages/workflow-server"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/blob": "2.0.0",
+    "@workflow/errors": "workspace:*",
+    "@workflow/world": "workspace:*",
+    "@workflow/world-postgres": "workspace:*",
+    "@workflow/world-vercel": "workspace:*",
+    "cbor-x": "1.6.0",
+    "hono": "4.12.3",
+    "zod": "catalog:",
+    "@hono/node-server": "1.19.9"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "11.12.0",
+    "@types/node": "catalog:",
+    "@workflow/tsconfig": "workspace:*",
+    "vitest": "catalog:"
+  },
+  "bin": {
+    "workflow-server": "./bin/serve.js"
+  }
+}
